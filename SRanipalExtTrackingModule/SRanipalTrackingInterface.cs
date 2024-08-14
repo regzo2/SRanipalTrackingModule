@@ -11,6 +11,8 @@ using VRCFaceTracking.Core.Library;
 using VRCFaceTracking.Core.Params.Data;
 using VRCFaceTracking.Core.Params.Expressions;
 using VRCFaceTracking.Core.Types;
+using SRanipalExtTrackingModule;
+using SRanipalExtTrackingModule.TrackingModels;
 
 namespace SRanipalExtTrackingInterface
 {
@@ -24,6 +26,9 @@ namespace SRanipalExtTrackingInterface
                             isWireless = false;
         private static Error eyeError = Error.UNDEFINED;
         private static Error lipError = Error.UNDEFINED;
+
+        private static ModuleConfig moduleConfig;
+        private static TrackingModel trackingModel;
 
         internal static Process? _process;
         internal static IntPtr _processHandle;
@@ -69,10 +74,11 @@ namespace SRanipalExtTrackingInterface
             // Get the directory of the sr_runtime.exe program from our start menu shortcut. This is where the SRanipal dlls are located.
             var srInstallDir = (string) Registry.LocalMachine.OpenSubKey(@"Software\VIVE\SRWorks\SRanipal")?.GetValue("ModuleFileName");
 
+            #region Remove Logs
             // Dang you SRanipal
             var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             var srLogsDirectory = Path.Combine(localAppData + @"Low\HTC Corporation\SR_Logs\SRAnipal_Logs");
-            
+
             // Get logs that should be yeeted.
             string[] srLogFiles = Directory.GetFiles(srLogsDirectory);
         
@@ -90,6 +96,9 @@ namespace SRanipalExtTrackingInterface
                     Logger.LogWarning($"Failed to delete log file \"{logFile}\"");
                 }
             }
+            #endregion
+
+            moduleConfig = ModuleJSONLoader.LoadConfig(Logger);
 
             if (srInstallDir == null)
             {
@@ -115,8 +124,8 @@ namespace SRanipalExtTrackingInterface
 
             SRanipal_API.InitialRuntime(); // hack to unblock sranipal!!!
 
-            eyeEnabled = InitTracker(SRanipal_Eye_v2.ANIPAL_TYPE_EYE_V2, "Eye");
-            lipEnabled = InitTracker(SRanipal_Lip_v2.ANIPAL_TYPE_LIP_V2, "Lip");
+            eyeEnabled = moduleConfig.UseEyeTracking && InitTracker(SRanipal_Eye_v2.ANIPAL_TYPE_EYE_V2, "Eye");
+            lipEnabled = moduleConfig.UseLipTracking && InitTracker(SRanipal_Lip_v2.ANIPAL_TYPE_LIP_V2, "Lip");
 
             if (eyeEnabled && Utils.HasAdmin)
             {
@@ -183,6 +192,8 @@ namespace SRanipalExtTrackingInterface
 
             isViveProEye = SRanipal_Eye_API.IsViveProEye();
 
+            trackingModel = TrackingModel.GetMatchingModule(moduleConfig.TrackingModelName);
+
             return (eyeAvailable && eyeEnabled, expressionAvailable && lipEnabled);
         }
 
@@ -239,8 +250,8 @@ namespace SRanipalExtTrackingInterface
             eyeError = SRanipal_Eye_API.GetEyeData_v2(ref eyeData);
             if (eyeError != Error.WORK) return false;
 
-            UpdateEyeParameters(ref UnifiedTracking.Data.Eye, eyeData.verbose_data);
-            UpdateEyeExpressions(ref UnifiedTracking.Data.Shapes, eyeData.expression_data);
+            trackingModel.UpdateEyeData(ref UnifiedTracking.Data.Eye, eyeData.verbose_data, isViveProEye);
+            trackingModel.UpdateEyeExpressions(ref UnifiedTracking.Data.Shapes, eyeData.expression_data);
 
             if (_processHandle == IntPtr.Zero || !UnifiedTracking.EyeImageData.SupportsImage) 
                 return true;
@@ -282,86 +293,12 @@ namespace SRanipalExtTrackingInterface
             return true;
         }
 
-        private static Vector3 GetConvergenceAngleOffset(VerboseData external)
-        {
-            var leftComp = Math.PI / 2 + Math.Asin(external.left.gaze_direction_normalized.FlipXCoordinates().x);
-            var rightComp = Math.PI / 2 - Math.Asin(external.right.gaze_direction_normalized.FlipXCoordinates().x);
-
-            var dynIPD_mm = external.left.gaze_origin_mm.x - external.right.gaze_origin_mm.x;
-
-            if (leftComp + rightComp >= Math.PI)
-                return new Vector3(0,0,0);
-
-            var rightSide_mm = Math.Sin(rightComp) * dynIPD_mm / Math.Sin(Math.PI - leftComp - rightComp);
-            var leftSide_mm = Math.Sin(leftComp) * dynIPD_mm / Math.Sin(Math.PI - rightComp - leftComp);
-
-            var convergenceDistance_mm = (leftSide_mm/2f) + (rightSide_mm/2f);
-
-
-            if (external.combined.eye_data.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_GAZE_DIRECTION_VALIDITY))
-                return new Vector3((float)Math.Atan((dynIPD_mm / 2f) / convergenceDistance_mm), 0, 0);
-            return Vector3.zero;
-        }
-
-        private void UpdateEyeParameters(ref UnifiedEyeData data, VerboseData external)
-        {
-            if (external.left.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_EYE_OPENNESS_VALIDITY))
-                data.Left.Openness = external.left.eye_openness;
-            if (external.right.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_EYE_OPENNESS_VALIDITY))
-                data.Right.Openness = external.right.eye_openness;
-
-            if (external.left.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_PUPIL_DIAMETER_VALIDITY))
-                data.Left.PupilDiameter_MM = external.left.pupil_diameter_mm;
-            if (external.right.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_PUPIL_DIAMETER_VALIDITY))
-                data.Right.PupilDiameter_MM = external.right.pupil_diameter_mm;
-            
-            if (isViveProEye)
-            {
-                if (external.left.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_GAZE_DIRECTION_VALIDITY))
-                    data.Left.Gaze = external.left.gaze_direction_normalized.FlipXCoordinates();
-                if (external.right.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_GAZE_DIRECTION_VALIDITY))
-                    data.Right.Gaze = external.right.gaze_direction_normalized.FlipXCoordinates();
-                return;
-            }
-            
-            // Fix for Focus 3 / Droolon F1 gaze tracking. For some reason convergence data isn't available from combined set so we will calculate it from the two gaze vectors.
-            if (external.left.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_GAZE_DIRECTION_VALIDITY) && external.right.GetValidity(SingleEyeDataValidity.SINGLE_EYE_DATA_GAZE_DIRECTION_VALIDITY))
-            {
-                Vector3 gaze_direction_normalized = (external.left.gaze_direction_normalized.FlipXCoordinates()/2f) + (external.right.gaze_direction_normalized.FlipXCoordinates()/2f);
-                //Vector3 convergenceOffset = GetConvergenceAngleOffset(external);
-                data.Left.Gaze = gaze_direction_normalized;
-                data.Right.Gaze = gaze_direction_normalized;
-            }
-        }
-
-        private void UpdateEyeExpressions(ref UnifiedExpressionShape[] data, EyeExpression external)
-        {
-            data[(int)UnifiedExpressions.EyeWideLeft].Weight = external.left.eye_wide;
-            data[(int)UnifiedExpressions.EyeWideRight].Weight = external.right.eye_wide;
-
-            data[(int)UnifiedExpressions.EyeSquintLeft].Weight = external.left.eye_squeeze;
-            data[(int)UnifiedExpressions.EyeSquintRight].Weight = external.right.eye_squeeze;
-
-            // Emulator expressions for Unified Expressions. These are essentially already baked into Legacy eye expressions (SRanipal)
-            data[(int)UnifiedExpressions.BrowInnerUpLeft].Weight = external.left.eye_wide;
-            data[(int)UnifiedExpressions.BrowOuterUpLeft].Weight = external.left.eye_wide;
-
-            data[(int)UnifiedExpressions.BrowInnerUpRight].Weight = external.right.eye_wide;
-            data[(int)UnifiedExpressions.BrowOuterUpRight].Weight = external.right.eye_wide;
-
-            data[(int)UnifiedExpressions.BrowPinchLeft].Weight = external.left.eye_squeeze;
-            data[(int)UnifiedExpressions.BrowLowererLeft].Weight = external.left.eye_squeeze;
-
-            data[(int)UnifiedExpressions.BrowPinchRight].Weight = external.right.eye_squeeze;
-            data[(int)UnifiedExpressions.BrowLowererRight].Weight = external.right.eye_squeeze;
-        }
-
         private bool UpdateMouth()
         {
             lipError = SRanipal_Lip_API.GetLipData_v2(ref lipData);
             if (lipError != Error.WORK)
                 return false;
-            UpdateMouthExpressions(ref UnifiedTracking.Data, lipData.prediction_data);
+            trackingModel.UpdateMouthExpressions(ref UnifiedTracking.Data.Shapes, lipData.prediction_data);
 
             if (lipData.image == IntPtr.Zero || !UnifiedTracking.LipImageData.SupportsImage) 
                 return true;
@@ -385,101 +322,6 @@ namespace SRanipalExtTrackingInterface
             }
 
             return true;
-        }
-
-        private void UpdateMouthExpressions(ref UnifiedTrackingData data, PredictionData_v2 external)
-        {
-            unsafe
-            {
-                #region Direct Jaw
-
-                data.Shapes[(int)UnifiedExpressions.JawOpen].Weight = external.blend_shape_weight[(int)LipShape_v2.JawOpen] + external.blend_shape_weight[(int)LipShape_v2.MouthApeShape];
-                data.Shapes[(int)UnifiedExpressions.JawLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.JawLeft];
-                data.Shapes[(int)UnifiedExpressions.JawRight].Weight = external.blend_shape_weight[(int)LipShape_v2.JawRight];
-                data.Shapes[(int)UnifiedExpressions.JawForward].Weight = external.blend_shape_weight[(int)LipShape_v2.JawForward];
-                data.Shapes[(int)UnifiedExpressions.MouthClosed].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthApeShape];
-
-                #endregion
-
-                #region Direct Mouth and Lip
-
-                // These shapes have overturns subtracting from them, as we are expecting the new standard to have Upper Up / Lower Down baked into the funneller shapes below these.
-                data.Shapes[(int)UnifiedExpressions.MouthUpperUpRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperUpRight] - external.blend_shape_weight[(int)LipShape_v2.MouthUpperOverturn];
-                data.Shapes[(int)UnifiedExpressions.MouthUpperDeepenRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperUpRight] - external.blend_shape_weight[(int)LipShape_v2.MouthUpperOverturn];
-                data.Shapes[(int)UnifiedExpressions.MouthUpperUpLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperUpLeft] - external.blend_shape_weight[(int)LipShape_v2.MouthUpperOverturn];
-                data.Shapes[(int)UnifiedExpressions.MouthUpperDeepenLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperUpLeft] - external.blend_shape_weight[(int)LipShape_v2.MouthUpperOverturn];
-
-                data.Shapes[(int)UnifiedExpressions.MouthLowerDownLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthLowerDownLeft] - external.blend_shape_weight[(int)LipShape_v2.MouthLowerOverturn];
-                data.Shapes[(int)UnifiedExpressions.MouthLowerDownRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthLowerDownRight] - external.blend_shape_weight[(int)LipShape_v2.MouthLowerOverturn];
-
-                data.Shapes[(int)UnifiedExpressions.LipPuckerUpperLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthPout];
-                data.Shapes[(int)UnifiedExpressions.LipPuckerLowerLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthPout];
-                data.Shapes[(int)UnifiedExpressions.LipPuckerUpperRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthPout];
-                data.Shapes[(int)UnifiedExpressions.LipPuckerLowerRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthPout];
-
-                data.Shapes[(int)UnifiedExpressions.LipFunnelUpperLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperOverturn];
-                data.Shapes[(int)UnifiedExpressions.LipFunnelUpperRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperOverturn];
-                data.Shapes[(int)UnifiedExpressions.LipFunnelLowerLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperOverturn];
-                data.Shapes[(int)UnifiedExpressions.LipFunnelLowerRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperOverturn];
-
-                data.Shapes[(int)UnifiedExpressions.LipSuckUpperLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperInside];
-                data.Shapes[(int)UnifiedExpressions.LipSuckUpperRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperInside];
-                data.Shapes[(int)UnifiedExpressions.LipSuckLowerLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthLowerInside];
-                data.Shapes[(int)UnifiedExpressions.LipSuckLowerRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthLowerInside];
-
-                data.Shapes[(int)UnifiedExpressions.MouthUpperLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperLeft];
-                data.Shapes[(int)UnifiedExpressions.MouthUpperRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthUpperRight];
-                data.Shapes[(int)UnifiedExpressions.MouthLowerLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthLowerLeft];
-                data.Shapes[(int)UnifiedExpressions.MouthLowerRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthLowerRight];
-
-                data.Shapes[(int)UnifiedExpressions.MouthCornerPullLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSmileLeft];
-                data.Shapes[(int)UnifiedExpressions.MouthCornerPullRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSmileRight];
-                data.Shapes[(int)UnifiedExpressions.MouthCornerSlantLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSmileLeft];
-                data.Shapes[(int)UnifiedExpressions.MouthCornerSlantRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSmileRight];
-                data.Shapes[(int)UnifiedExpressions.MouthFrownLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSadLeft];
-                data.Shapes[(int)UnifiedExpressions.MouthFrownRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSadRight];
-
-                data.Shapes[(int)UnifiedExpressions.MouthRaiserUpper].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthLowerOverlay] - external.blend_shape_weight[(int)LipShape_v2.MouthUpperInside];
-                data.Shapes[(int)UnifiedExpressions.MouthRaiserLower].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthLowerOverlay];
-
-                #endregion
-
-                #region Direct Cheek
-
-                data.Shapes[(int)UnifiedExpressions.CheekPuffLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.CheekPuffLeft];
-                data.Shapes[(int)UnifiedExpressions.CheekPuffRight].Weight = external.blend_shape_weight[(int)LipShape_v2.CheekPuffRight];
-
-                data.Shapes[(int)UnifiedExpressions.CheekSuckLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.CheekSuck];
-                data.Shapes[(int)UnifiedExpressions.CheekSuckRight].Weight = external.blend_shape_weight[(int)LipShape_v2.CheekSuck];
-
-                #endregion
-
-                #region Direct Tongue
-
-                data.Shapes[(int)UnifiedExpressions.TongueOut].Weight = (external.blend_shape_weight[(int)LipShape_v2.TongueLongStep1] + external.blend_shape_weight[(int)LipShape_v2.TongueLongStep2]) / 2.0f;
-                data.Shapes[(int)UnifiedExpressions.TongueUp].Weight = external.blend_shape_weight[(int)LipShape_v2.TongueUp];
-                data.Shapes[(int)UnifiedExpressions.TongueDown].Weight = external.blend_shape_weight[(int)LipShape_v2.TongueDown];
-                data.Shapes[(int)UnifiedExpressions.TongueLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.TongueLeft];
-                data.Shapes[(int)UnifiedExpressions.TongueRight].Weight = external.blend_shape_weight[(int)LipShape_v2.TongueRight];
-                data.Shapes[(int)UnifiedExpressions.TongueRoll].Weight = external.blend_shape_weight[(int)LipShape_v2.TongueRoll];
-
-                #endregion
-
-                // These shapes are not tracked at all by SRanipal, but instead are being treated as enhancements to driving the shapes above.
-
-                #region Emulated Unified Mapping
-
-                data.Shapes[(int)UnifiedExpressions.CheekSquintLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSmileLeft];
-                data.Shapes[(int)UnifiedExpressions.CheekSquintRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSmileRight];
-
-                data.Shapes[(int)UnifiedExpressions.MouthDimpleLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSmileLeft];
-                data.Shapes[(int)UnifiedExpressions.MouthDimpleRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSmileRight];
-
-                data.Shapes[(int)UnifiedExpressions.MouthStretchLeft].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSadRight];
-                data.Shapes[(int)UnifiedExpressions.MouthStretchRight].Weight = external.blend_shape_weight[(int)LipShape_v2.MouthSadRight];
-
-                #endregion
-            }
         }
     }
 }
